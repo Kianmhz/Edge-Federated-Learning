@@ -304,7 +304,7 @@ cd ..
 
 ## Azure Cloud Setup
 
-These steps create the Azure resources needed to run the system in Service Bus mode. Only needs to be done once per team.
+These steps create the Azure resources needed to run the system in Service Bus mode.
 
 ### Step 1: Create a Resource Group
 
@@ -417,16 +417,6 @@ export FL_TRANSPORT=servicebus
 export AZURE_SERVICEBUS_CONNECTION_STRING="Endpoint=sb://fl-demo-sb.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=YOUR_KEY_HERE"
 export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=fldemostore;AccountKey=YOUR_KEY_HERE;EndpointSuffix=core.windows.net"
 ```
-
-### Cleanup (after demo)
-
-```bash
-az group delete --name fl-demo-rg --yes --no-wait
-```
-
-This deletes everything: namespace, topics, queues, storage account.
-
----
 
 ## Quick Start
 
