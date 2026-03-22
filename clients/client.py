@@ -59,6 +59,93 @@ def _add_dp_to_update(
     return _serialize_state(noised_update)
 
 
+def run_client_loop_sb(
+    train_loader,
+    client_id,
+    sb_manager,
+    dp_enabled=False,
+    noise_multiplier=0.0,
+    clip_norm=1.0,
+    debug=False,
+):
+    """Event-driven client loop using Azure Service Bus.
+
+    Instead of polling HTTP endpoints, the client:
+      1. Waits for a round-control message (topic subscription)
+      2. Receives the global model via claim-check (topic + blob)
+      3. Trains locally
+      4. Submits the weight delta via claim-check (queue + blob)
+      5. Waits for the next round-control message (no polling needed)
+    """
+    print(f"[Client {client_id}] Running in Service Bus transport mode")
+
+    while True:
+        # --- Phase 1: Wait for round selection via Service Bus ---
+        print(f"[Client {client_id}] Waiting for round-control message...")
+        round_id, selected = sb_manager.wait_for_round_control(
+            client_id, timeout=120.0
+        )
+
+        if round_id is None:
+            print(f"[Client {client_id}] Timed out waiting for round-control. Retrying...")
+            continue
+
+        print(f"[Client {client_id}] Selected for round {round_id}. Receiving global model...")
+
+        # --- Phase 2: Receive global model via claim-check ---
+        model_round, weights = sb_manager.receive_global_model(timeout=30.0)
+
+        if weights is None:
+            # Fallback: fetch via HTTP if Service Bus delivery fails
+            print(f"[Client {client_id}] Service Bus model delivery failed, falling back to HTTP...")
+            try:
+                r = requests.get(f"{SERVER_URL}/get_model").json()
+                weights = {k: torch.tensor(v) for k, v in r["weights"].items()}
+            except Exception as e:
+                print(f"[Client {client_id}] HTTP fallback also failed: {e}. Skipping round.")
+                continue
+
+        # Load weights into model
+        model = get_model()
+        # weights from blob are already tensors; from HTTP fallback they're also tensors
+        model.load_state_dict(weights)
+
+        # --- Phase 3: Train locally ---
+        print(f"[Client {client_id}] Training locally...")
+        global_state = {k: v.clone().float() for k, v in weights.items()}
+        model = train_local(model, train_loader, epochs=1)
+        local_state = {k: v.clone().float() for k, v in model.state_dict().items()}
+
+        # --- Phase 4: Compute update delta (with optional DP) ---
+        if dp_enabled and debug:
+            raw_update = {
+                k: (local_state[k] - global_state[k]).float()
+                for k in global_state.keys()
+            }
+
+        weights_to_send = _add_dp_to_update(
+            global_state, local_state,
+            clip_norm=clip_norm,
+            noise_multiplier=noise_multiplier,
+            dp_enabled=dp_enabled,
+        )
+
+        # --- Phase 5: Submit via Service Bus claim-check ---
+        print(f"[Client {client_id}] Sending update via Service Bus... (DP={'ON' if dp_enabled else 'OFF'})")
+        try:
+            sb_manager.submit_client_update(
+                client_id=str(client_id),
+                round_id=round_id,
+                weights=weights_to_send,
+                data_size=len(train_loader.dataset),
+            )
+            print(f"[Client {client_id}] Update sent for round {round_id}. Waiting for next round...\n")
+        except Exception as e:
+            print(f"[Client {client_id}] Service Bus submit failed: {e}")
+
+        # No polling needed — the next iteration blocks on wait_for_round_control
+
+
 def run_client_loop(
     train_loader,
     client_id,
@@ -265,6 +352,12 @@ if __name__ == "__main__":
         default=0.5,
         help="Dirichlet alpha parameter (smaller -> more skew)",
     )
+    parser.add_argument(
+        "--transport",
+        choices=["http", "servicebus"],
+        default=os.environ.get("FL_TRANSPORT", "http"),
+        help="Transport mode: 'http' (REST polling) or 'servicebus' (Azure Service Bus)",
+    )
 
     args = parser.parse_args()
 
@@ -276,6 +369,16 @@ if __name__ == "__main__":
     except Exception as e:
         num_clients = None
         print(f"[CLIENT] Failed to fetch server config: {e}. Falling back to default loader behavior")
+
+    # Initialize Service Bus manager if transport=servicebus
+    sb_mgr = None
+    if args.transport == "servicebus":
+        from service_bus.config import ServiceBusConfig
+        from service_bus.manager import ServiceBusManager
+        sb_cfg = ServiceBusConfig.from_env()
+        sb_cfg.validate()
+        sb_mgr = ServiceBusManager(sb_cfg)
+        print(f"[CLIENT] Azure Service Bus transport ENABLED")
 
     num_clients_display = num_clients if num_clients is not None else "unknown"
     # print whether we're running IID or non-IID
@@ -327,15 +430,19 @@ if __name__ == "__main__":
                 )
                 train_loader, _ = get_dataloader()
 
-            # use the shared run_client_loop to avoid duplication
-            run_client_loop(
-                train_loader,
-                client_id,
+            # Dispatch to Service Bus or HTTP loop
+            loop_fn = run_client_loop_sb if sb_mgr else run_client_loop
+            loop_kwargs = dict(
+                train_loader=train_loader,
+                client_id=client_id,
                 dp_enabled=dp_enabled,
                 noise_multiplier=noise_multiplier,
                 clip_norm=clip_norm,
                 debug=debug,
             )
+            if sb_mgr:
+                loop_kwargs["sb_manager"] = sb_mgr
+            loop_fn(**loop_kwargs)
 
         # run the modified client loop
         client_loop_with_local_loader(
@@ -346,11 +453,24 @@ if __name__ == "__main__":
             debug=args.debug,
         )
     else:
-        # pass debug flag through to client loop; debug prints are gated by dp_enabled && args.debug
-        client_loop(
-            args.client_id,
-            dp_enabled=args.dp,
-            noise_multiplier=args.noise,
-            clip_norm=args.clip,
-            debug=args.debug,
-        )
+        if sb_mgr:
+            # Service Bus mode with full dataset (no partitioning)
+            train_loader, _ = get_dataloader()
+            run_client_loop_sb(
+                train_loader,
+                args.client_id,
+                sb_manager=sb_mgr,
+                dp_enabled=args.dp,
+                noise_multiplier=args.noise,
+                clip_norm=args.clip,
+                debug=args.debug,
+            )
+        else:
+            # Original HTTP mode
+            client_loop(
+                args.client_id,
+                dp_enabled=args.dp,
+                noise_multiplier=args.noise,
+                clip_norm=args.clip,
+                debug=args.debug,
+            )
