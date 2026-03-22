@@ -13,6 +13,17 @@ class Aggregator:
     def get_weights(self):
         return {k: v.cpu().tolist() for k, v in self.global_model.state_dict().items()}
 
+    @staticmethod
+    def _to_tensor(val):
+        """Convert a value to a tensor if it isn't already.
+
+        Handles both JSON-deserialized lists (from HTTP) and torch.Tensor
+        values (from Service Bus blob deserialization).
+        """
+        if isinstance(val, torch.Tensor):
+            return val
+        return torch.tensor(val)
+
     def receive_update(self, weights, data_size):
         self.updates.append(weights)
         self.data_sizes.append(data_size)
@@ -35,12 +46,12 @@ class Aggregator:
         for key in global_state.keys():
             if use_data_weights:
                 avg_delta_tensor = sum(
-                    (torch.tensor(update[key]) * (ds / total_data))
+                    (self._to_tensor(update[key]) * (ds / total_data))
                     for update, ds in zip(self.updates, self.data_sizes)
                 )
             else:
                 # uniform average over updates
-                avg_delta_tensor = sum((torch.tensor(update[key]) for update in self.updates)) / len(self.updates)
+                avg_delta_tensor = sum((self._to_tensor(update[key]) for update in self.updates)) / len(self.updates)
             avg_delta[key] = avg_delta_tensor
 
         # Apply averaged delta: global + avg_delta

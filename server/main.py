@@ -14,6 +14,17 @@ import time
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from server.aggregator import Aggregator
+from service_bus.config import ServiceBusConfig
+
+# ============ AZURE SERVICE BUS SETUP ============
+sb_config = ServiceBusConfig.from_env()
+sb_manager = None
+
+if sb_config.enabled:
+    sb_config.validate()
+    from service_bus.manager import ServiceBusManager
+    sb_manager = ServiceBusManager(sb_config)
+    print("[SERVER] Azure Service Bus transport ENABLED")
 
 # ============ SETUP FASTAPI ============
 app = FastAPI(title="Federated Learning Server", version="1.0.0")
@@ -105,6 +116,14 @@ def select_participants_for_round(round_idx: int):
         add_to_client_history(client_id, "selected", {"round": round_idx})
     
     print(f"[SERVER] Selected {len(sampled)} participants for round {round_idx}: {sorted(list(sampled))}")
+
+    # Notify clients via Service Bus (if enabled)
+    if sb_manager:
+        try:
+            sb_manager.publish_round_control(round_idx, sorted(list(sampled)))
+        except Exception as e:
+            print(f"[SB] Failed to publish round-control: {e}")
+
     return sampled
 
 
@@ -178,9 +197,26 @@ def perform_aggregation(round_num, trigger="normal"):
         })
 
         print(f"[SERVER] ✅ Round {finished_round} complete. Acc: {accuracy:.2%}, Loss: {loss:.4f}")
-        
+
+        # Publish via Service Bus (if enabled)
+        if sb_manager:
+            try:
+                sb_manager.publish_global_model(
+                    agg.current_round, agg.global_model.state_dict()
+                )
+                sb_manager.publish_dashboard_event({
+                    "type": "round_complete",
+                    "round": finished_round,
+                    "accuracy": accuracy,
+                    "loss": loss,
+                    "num_updates": agg.last_num_updates,
+                    "timestamp": datetime.now().isoformat(),
+                })
+            except Exception as e:
+                print(f"[SB] Failed to publish post-aggregation events: {e}")
+
         return True
-        
+
     finally:
         aggregation_in_progress = False
 
@@ -430,6 +466,76 @@ monitor_thread = threading.Thread(target=_aggregation_monitor, daemon=True)
 monitor_thread.start()
 
 
+# ============ SERVICE BUS RECEIVER THREAD ============
+
+def _sb_update_receiver():
+    """Background thread: receive client updates from the Service Bus queue.
+
+    Mirrors the logic in the /submit_update endpoint but reads from the
+    'client-updates' queue instead of HTTP POST. Uses the claim-check
+    pattern to retrieve full weight tensors from Blob Storage.
+    """
+    if not sb_manager:
+        return
+
+    def handle_update(client_id, round_id, weights, data_size):
+        current_round = agg.current_round
+
+        # Round validation (same as HTTP endpoint)
+        if round_id != current_round:
+            print(f"[SB] Stale update from client {client_id} "
+                  f"(client_round={round_id}, server_round={current_round}) - rejecting")
+            return
+
+        # Duplicate check
+        submitted_set = submitted_clients_by_round.get(current_round, set())
+        if client_id in submitted_set:
+            print(f"[SB] Duplicate submission from client {client_id} - rejecting")
+            return
+
+        connected_clients.add(client_id)
+
+        # Weights arrive as {str: Tensor} from blob deserialization;
+        # convert to JSON-compatible lists so the aggregator handles them
+        # the same way as HTTP submissions.
+        weights_as_lists = {k: v.cpu().tolist() for k, v in weights.items()}
+
+        try:
+            agg.receive_update(weights_as_lists, data_size)
+        except Exception as e:
+            print(f"[SB] Failed to process update from {client_id}: {e}")
+            return
+
+        submitted_set.add(client_id)
+        submitted_clients_by_round[current_round] = submitted_set
+
+        clients_status[client_id] = {
+            "status": "submitted",
+            "timestamp": datetime.now().isoformat(),
+            "data_size": data_size,
+            "round": current_round,
+        }
+        add_to_client_history(client_id, "submitted", {
+            "round": current_round,
+            "data_size": data_size,
+            "transport": "servicebus",
+        })
+
+        updates_needed = get_updates_per_round()
+        print(f"[SB] Client {client_id} submitted. Updates: {len(agg.updates)}/{updates_needed}")
+
+        if len(agg.updates) >= updates_needed:
+            perform_aggregation(current_round, trigger="sufficient_updates_sb")
+
+    print("[SB] Starting client-updates receiver thread...")
+    sb_manager.receive_client_updates(handle_update)
+
+
+if sb_manager:
+    sb_receiver_thread = threading.Thread(target=_sb_update_receiver, daemon=True)
+    sb_receiver_thread.start()
+
+
 # ============ HELPER FUNCTIONS ============
 
 def evaluate_model():
@@ -466,10 +572,13 @@ def evaluate_model():
 if __name__ == "__main__":
     import uvicorn
 
+    transport_mode = "Azure Service Bus" if sb_manager else "HTTP (REST)"
+
     print("=" * 70)
     print("🚀 FEDERATED LEARNING SERVER")
     print("=" * 70)
     print(f"📍 Server:    http://127.0.0.1:9000")
+    print(f"🔗 Transport: {transport_mode}")
     print(f"⚙️  Min Updates: {MIN_UPDATES_TO_AGGREGATE}")
     print(f"⚙️  Participation: {PARTICIPATION_PROB * 100:.0f}%")
     print(f"⚙️  Timeout: {AGGREGATION_TIMEOUT}s")
