@@ -109,38 +109,43 @@ flowchart TD
 In Service Bus mode, the server **pushes** events to clients through topics, and clients **send** updates through queues. No polling needed — communication is fully event-driven:
 
 ```mermaid
-flowchart TD
+flowchart LR
     subgraph clients["Edge Devices"]
+        direction TB
         C1["Client 1"]
         C2["Client 2"]
         CN["Client N"]
     end
 
     subgraph asb["Azure Service Bus"]
-        RC["Topic: round-control\n(sub: all-clients)"]
-        GMt["Topic: global-model\n(sub: fl-clients)"]
-        CUQ["Queue: client-updates"]
-        DEQ["Queue: dashboard-events"]
+        direction TB
+        RC["Topic · round-control\n(sub: all-clients)"]
+        GMt["Topic · global-model\n(sub: fl-clients)"]
+        CUQ["Queue · client-updates"]
+        DEQ["Queue · dashboard-events"]
     end
 
-    BLOB[("Azure Blob Storage\nfl-model-weights/\n• round-N/global-model\n• round-N/client-ID")]
+    BLOB[("Azure Blob Storage\nfl-model-weights/")]
 
     subgraph server["Aggregation Server"]
-        FA["FedAvg Aggregation\n+ Global Model"]
+        FA["FedAvg\n+ Global Model"]
     end
 
-    D["Dashboard (React UI)"]
+    D["Dashboard\n(React UI)"]
 
-    server -- "① publish round event\n(selected client IDs)" --> RC
-    RC -- "② fan-out to all clients" --> clients
-    server -- "③ upload model weights" --> BLOB
-    server -- "④ publish blob reference" --> GMt
-    GMt -- "⑤ deliver blob ref" --> clients
-    clients -- "⑥ download model" --> BLOB
-    clients -- "⑦ upload weight delta" --> BLOB
-    clients -- "⑧ send blob reference" --> CUQ
-    CUQ -- "⑨ deliver update ref" --> server
-    server -- "⑩ push round_complete event" --> DEQ
+    server  -- "① publish round event"    --> RC
+    RC      -- "② fan-out to all clients" --> clients
+
+    server  -- "③ upload model weights"   --> BLOB
+    server  -- "④ publish blob reference" --> GMt
+    GMt     -- "⑤ deliver blob reference" --> clients
+    BLOB    -- "⑥ download model weights" --> clients
+
+    clients -- "⑦ upload weight delta"    --> BLOB
+    clients -- "⑧ send blob reference"    --> CUQ
+    CUQ     -- "⑨ deliver update ref"     --> server
+
+    server  -- "⑩ push round_complete"   --> DEQ
     DEQ --> D
 ```
 
