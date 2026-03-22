@@ -1,0 +1,13 @@
+# Credentials - NEVER commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Data
+data/
+
+# OS
+.DS_Store
