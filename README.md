@@ -82,68 +82,66 @@ Federated Learning System that:
 
 In HTTP mode, clients **poll** the server repeatedly to check participation, download models, and submit updates:
 
-```
-┌───────────────┐     ┌───────────────┐     ┌───────────────┐
-│   Client 1    │     │   Client 2    │     │   Client 3    │
-│ ┌───────────┐ │     │ ┌───────────┐ │     │ ┌───────────┐ │
-│ │Local Data │ │     │ │Local Data │ │     │ │Local Data │ │
-│ └───────────┘ │     │ └───────────┘ │     │ └───────────┘ │
-│       ↓       │     │       ↓       │     │       ↓       │
-│ ┌───────────┐ │     │ ┌───────────┐ │     │ ┌───────────┐ │
-│ │   Train   │ │     │ │   Train   │ │     │ │   Train   │ │
-│ │  Locally  │ │     │ │  Locally  │ │     │ │  Locally  │ │
-│ └───────────┘ │     │ └───────────┘ │     │ └───────────┘ │
-└───────┬───────┘     └───────┬───────┘     └───────┬───────┘
-        │                     │                     │
-        │   HTTP Polling      │                     │
-        │   (REST API)        │                     │
-        └─────────────────────┼─────────────────────┘
-                              ↓
-                ┌──────────────────────────────┐
-                │     Aggregation Server       │
-                │  ┌────────────────────────┐  │
-                │  │  Federated Averaging   │  │
-                │  └────────────────────────┘  │
-                │             ↓                │
-                │  ┌────────────────────────┐  │
-                │  │    Global Model        │  │
-                │  └────────────────────────┘  │
-                └──────────────┬───────────────┘
-                               ↓
-                    ┌────────────────────┐
-                    │   Dashboard (UI)   │
-                    └────────────────────┘
+```mermaid
+flowchart TD
+    subgraph edge["Edge Devices"]
+        C1["Client 1\nLocal Data → Train Locally"]
+        C2["Client 2\nLocal Data → Train Locally"]
+        C3["Client 3\nLocal Data → Train Locally"]
+    end
+
+    subgraph srv["Aggregation Server"]
+        FA["FedAvg Aggregation"]
+        GM["Global Model"]
+        FA --> GM
+    end
+
+    D["Dashboard (React UI)"]
+
+    C1 -- "GET /should_participate\nGET /get_model\nPOST /submit_update" --> srv
+    C2 -- "GET /should_participate\nGET /get_model\nPOST /submit_update" --> srv
+    C3 -- "GET /should_participate\nGET /get_model\nPOST /submit_update" --> srv
+    GM -- "GET /status\nGET /metrics (polling)" --> D
 ```
 
 ### Azure Service Bus Mode (Event-Driven)
 
 In Service Bus mode, the server **pushes** events to clients through topics, and clients **send** updates through queues. No polling needed — communication is fully event-driven:
 
-```
-CLIENTS                     AZURE SERVICE BUS                     SERVER
+```mermaid
+flowchart TD
+    subgraph clients["Edge Devices"]
+        C1["Client 1"]
+        C2["Client 2"]
+        CN["Client N"]
+    end
 
-┌────────┐   subscribe   ┌───────────────────────┐   publish
-│Client 1│◄─────────────│Topic: round-control    │◄───────────── Server
-│Client 2│◄─────────────│ (Sub: all-clients)     │  "Round 3 started,
-│Client N│◄─────────────└───────────────────────┘   clients [1,2] selected"
-│        │
-│        │   subscribe   ┌───────────────────────┐   publish
-│        │◄─────────────│Topic: global-model     │◄───────────── Server
-│        │              │ (Sub: fl-clients)      │  (claim-check: blob ref)
-│        │              └───────────────────────┘
-│        │                        ┌──────────────────────┐
-│        │              ┌────────►│ Azure Blob Storage   │◄────────┐
-│        │              │ upload  │ fl-model-weights/    │ upload  │
-│        │              │         │  round-3/global-model│         │
-│        │              │         │  round-3/client-1    │         │
-│        │   send       │         └──────────────────────┘         │
-│        │──────────────┼──►┌───────────────────────┐              │
-└────────┘              │   │Queue: client-updates   │──────────►Server
-                        │   └───────────────────────┘  receive
-                        │
-                        │   ┌───────────────────────┐
-         Dashboard ◄────┴──│Queue: dashboard-events │◄───────── Server
-                            └───────────────────────┘
+    subgraph asb["Azure Service Bus"]
+        RC["Topic: round-control\n(sub: all-clients)"]
+        GMt["Topic: global-model\n(sub: fl-clients)"]
+        CUQ["Queue: client-updates"]
+        DEQ["Queue: dashboard-events"]
+    end
+
+    BLOB[("Azure Blob Storage\nfl-model-weights/\n• round-N/global-model\n• round-N/client-ID")]
+
+    subgraph server["Aggregation Server"]
+        FA["FedAvg Aggregation\n+ Global Model"]
+    end
+
+    D["Dashboard (React UI)"]
+
+    server -- "① publish round event\n(selected client IDs)" --> RC
+    RC -- "② fan-out to all clients" --> clients
+    server -- "③ upload model weights" --> BLOB
+    server -- "④ publish blob reference" --> GMt
+    GMt -- "⑤ deliver blob ref" --> clients
+    clients -- "⑥ download model" --> BLOB
+    clients -- "⑦ upload weight delta" --> BLOB
+    clients -- "⑧ send blob reference" --> CUQ
+    CUQ -- "⑨ deliver update ref" --> server
+    server -- "⑩ push round_complete event" --> DEQ
+    DEQ --> D
 ```
 
 ---
@@ -228,18 +226,19 @@ The REST endpoints remain active, so the dashboard works in both modes without c
 
 The claim-check pattern solves the problem of sending large payloads through a message broker that has size limits:
 
-```
-SENDER                    BLOB STORAGE              SERVICE BUS             RECEIVER
-  │                            │                        │                      │
-  ├── 1. Upload weights ──────►│                        │                      │
-  │       (2 MB binary)        │                        │                      │
-  │                            │◄── blob name ──────────┤                      │
-  ├── 2. Send reference ──────────────────────────────►│                      │
-  │       (100 bytes)          │                        │── 3. Deliver ref ──►│
-  │                            │                        │                      │
-  │                            │◄────── 4. Download ───────────────────────────┤
-  │                            │─────── weights ───────────────────────────────►│
-  │                            │        (2 MB binary)   │                      │
+```mermaid
+sequenceDiagram
+    participant S as Sender<br/>(Server or Client)
+    participant B as Azure Blob Storage
+    participant SB as Azure Service Bus
+    participant R as Receiver<br/>(Client or Server)
+
+    S->>B: 1. Upload model weights (2 MB binary)
+    B-->>S: blob name / URL
+    S->>SB: 2. Publish lightweight reference (100 bytes)<br/>{"round": 5, "blob_name": "round-5/global-model"}
+    SB->>R: 3. Deliver reference message
+    R->>B: 4. Download weights using blob name (2 MB binary)
+    B-->>R: model weights
 ```
 
 Old blobs are automatically cleaned up — only the last 3 rounds are kept.
