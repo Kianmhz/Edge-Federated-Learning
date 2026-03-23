@@ -79,6 +79,12 @@ def run_client_loop_sb(
     """
     print(f"[Client {client_id}] Running in Service Bus transport mode")
 
+    # Pre-create per-client subscriptions on both topics before entering the
+    # loop. Azure Service Bus only delivers messages to subscriptions that
+    # existed at publish time, so these must exist before the server calls
+    # publish_round_control / publish_global_model.
+    sb_manager.ensure_client_subscriptions(str(client_id))
+
     while True:
         # --- Phase 1: Register with server to trigger round selection ---
         # The server only publishes round-control when it knows clients are connected.
@@ -101,7 +107,7 @@ def run_client_loop_sb(
         print(f"[Client {client_id}] Selected for round {round_id}. Receiving global model...")
 
         # --- Phase 2: Receive global model via claim-check ---
-        model_round, weights = sb_manager.receive_global_model(timeout=30.0)
+        model_round, weights = sb_manager.receive_global_model(str(client_id), timeout=30.0)
 
         if weights is None:
             # Fallback: fetch via HTTP if Service Bus delivery fails
@@ -369,14 +375,22 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Always fetch num_clients from server config before printing split info
-    try:
-        cfg = requests.get(f"{SERVER_URL}/config").json()
-        num_clients = int(cfg.get("num_clients", 0)) or None
-        print(f"[CLIENT] Fetched num_clients={num_clients} from server config")
-    except Exception as e:
-        num_clients = None
-        print(f"[CLIENT] Failed to fetch server config: {e}. Falling back to default loader behavior")
+    # Fetch num_clients from server config. When FL_NUM_CLIENTS is set server-side
+    # the value is stable; without it the server returns len(connected_clients) which
+    # can be 0 or 1 if other clients haven't registered yet. Retry briefly to let
+    # clients settle, but cap at 3 attempts to avoid blocking indefinitely.
+    num_clients = None
+    for _attempt in range(3):
+        try:
+            cfg = requests.get(f"{SERVER_URL}/config", timeout=5).json()
+            val = int(cfg.get("num_clients", 0)) or None
+            if val is not None:
+                num_clients = val
+                break
+        except Exception as e:
+            print(f"[CLIENT] Failed to fetch server config (attempt {_attempt+1}): {e}")
+        time.sleep(1)
+    print(f"[CLIENT] Fetched num_clients={num_clients} from server config")
 
     # Initialize Service Bus manager if transport=servicebus
     sb_mgr = None

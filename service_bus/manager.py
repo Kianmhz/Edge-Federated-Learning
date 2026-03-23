@@ -18,6 +18,7 @@ import time
 from datetime import datetime
 
 from azure.servicebus import ServiceBusClient, ServiceBusMessage
+from azure.servicebus.management import ServiceBusAdministrationClient
 
 from service_bus.config import ServiceBusConfig
 from service_bus.claim_check import BlobClaimCheck
@@ -32,9 +33,29 @@ class ServiceBusManager:
         self._sb_client = ServiceBusClient.from_connection_string(
             config.servicebus_connection_string
         )
+        self._admin_client = ServiceBusAdministrationClient.from_connection_string(
+            config.servicebus_connection_string
+        )
         self._blob = BlobClaimCheck(
             config.storage_connection_string, config.storage_container
         )
+        self._ensured_subscriptions: set = set()
+
+    def _ensure_subscription(self, topic_name: str, subscription_name: str):
+        """Create a topic subscription if it doesn't already exist."""
+        key = (topic_name, subscription_name)
+        if key in self._ensured_subscriptions:
+            return
+        try:
+            self._admin_client.get_subscription(topic_name, subscription_name)
+        except Exception:
+            try:
+                self._admin_client.create_subscription(topic_name, subscription_name)
+                print(f"[SB] Created subscription '{subscription_name}' on topic '{topic_name}'")
+            except Exception as e:
+                # May already exist due to a race — that's fine
+                print(f"[SB] Subscription '{subscription_name}' on '{topic_name}': {e}")
+        self._ensured_subscriptions.add(key)
 
     # ------------------------------------------------------------------
     # SERVER-SIDE: Publishing
@@ -168,15 +189,29 @@ class ServiceBusManager:
     # CLIENT-SIDE: Subscribing
     # ------------------------------------------------------------------
 
+    def ensure_client_subscriptions(self, client_id: str):
+        """Pre-create per-client subscriptions on both topics.
+
+        Must be called before entering the client loop so that subscriptions
+        exist when the server publishes messages. Messages published to a topic
+        before a subscription exists are never retroactively delivered.
+        """
+        self._ensure_subscription(self._config.round_control_topic, f"client-{client_id}")
+        self._ensure_subscription(self._config.global_model_topic, f"client-{client_id}")
+
     def wait_for_round_control(self, client_id: str, timeout: float = 60.0):
         """Block until a round-control message selects this client.
 
         Returns (round_id, selected_clients) or (None, None) on timeout.
-        Messages where this client is NOT selected are completed and skipped.
+        Each client uses its own subscription so messages are not stolen by
+        competing consumers.
         """
+        subscription_name = f"client-{client_id}"
+        self._ensure_subscription(self._config.round_control_topic, subscription_name)
+
         receiver = self._sb_client.get_subscription_receiver(
             topic_name=self._config.round_control_topic,
-            subscription_name=self._config.round_control_subscription,
+            subscription_name=subscription_name,
             max_wait_time=int(timeout),
         )
         with receiver:
@@ -202,15 +237,19 @@ class ServiceBusManager:
 
         return None, None
 
-    def receive_global_model(self, timeout: float = 30.0):
+    def receive_global_model(self, client_id: str, timeout: float = 30.0):
         """Block until the global model is available on the topic.
 
         Returns (round_id, weights_dict) or (None, None) on timeout.
         Uses claim-check: downloads weights from Blob Storage.
+        Each client uses its own subscription to receive its own copy.
         """
+        subscription_name = f"client-{client_id}"
+        self._ensure_subscription(self._config.global_model_topic, subscription_name)
+
         receiver = self._sb_client.get_subscription_receiver(
             topic_name=self._config.global_model_topic,
-            subscription_name=self._config.global_model_subscription,
+            subscription_name=subscription_name,
             max_wait_time=int(timeout),
         )
         with receiver:
@@ -274,6 +313,10 @@ class ServiceBusManager:
         """Release Service Bus and Blob Storage connections."""
         try:
             self._sb_client.close()
+        except Exception:
+            pass
+        try:
+            self._admin_client.close()
         except Exception:
             pass
         try:
