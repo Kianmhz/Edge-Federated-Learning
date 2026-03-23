@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import './App.css';
 
-const SERVER_URL = 'http://127.0.0.1:9000';
+const SERVER_URL = process.env.REACT_APP_SERVER_URL || 'http://127.0.0.1:9000';
 
 function App() {
   const [status, setStatus] = useState({
