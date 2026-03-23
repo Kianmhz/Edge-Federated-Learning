@@ -1,6 +1,7 @@
 # ============ IMPORTS ============
 import os
 import sys
+import logging
 from datetime import datetime
 from math import ceil
 import random
@@ -11,6 +12,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import threading
 import time
+
+# Suppress noisy dashboard polling from uvicorn access logs
+class _SuppressDashboardPolling(logging.Filter):
+    _PATHS = frozenset(["/status", "/metrics", "/config"])
+    def filter(self, record):
+        msg = record.getMessage()
+        return not any(f'"GET {p} ' in msg for p in self._PATHS)
+
+logging.getLogger("uvicorn.access").addFilter(_SuppressDashboardPolling())
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from server.aggregator import Aggregator
