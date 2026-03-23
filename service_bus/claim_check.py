@@ -33,7 +33,7 @@ class BlobClaimCheck:
         blob_client = self._blob_service.get_blob_client(
             container=self._container_name, blob=blob_name
         )
-        blob_client.upload_blob(payload, overwrite=True)
+        blob_client.upload_blob(payload, overwrite=True, max_concurrency=8)
         return blob_name
 
     def retrieve(self, blob_name: str) -> bytes:
