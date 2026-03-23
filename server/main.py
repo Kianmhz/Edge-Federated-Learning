@@ -1,6 +1,7 @@
 # ============ IMPORTS ============
 import os
 import sys
+import logging
 from datetime import datetime
 from math import ceil
 import random
@@ -12,8 +13,28 @@ from pydantic import BaseModel
 import threading
 import time
 
+# Suppress noisy dashboard polling from uvicorn access logs
+class _SuppressDashboardPolling(logging.Filter):
+    _PATHS = frozenset(["/status", "/metrics", "/config"])
+    def filter(self, record):
+        msg = record.getMessage()
+        return not any(f'"GET {p} ' in msg for p in self._PATHS)
+
+logging.getLogger("uvicorn.access").addFilter(_SuppressDashboardPolling())
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from server.aggregator import Aggregator
+from service_bus.config import ServiceBusConfig
+
+# ============ AZURE SERVICE BUS SETUP ============
+sb_config = ServiceBusConfig.from_env()
+sb_manager = None
+
+if sb_config.enabled:
+    sb_config.validate()
+    from service_bus.manager import ServiceBusManager
+    sb_manager = ServiceBusManager(sb_config)
+    print("[SERVER] Azure Service Bus transport ENABLED")
 
 # ============ SETUP FASTAPI ============
 app = FastAPI(title="Federated Learning Server", version="1.0.0")
@@ -35,11 +56,14 @@ round_participation = {}  # Track who was selected and who participated per roun
 # Configuration
 PARTICIPATION_PROB = float(os.environ.get("FL_PARTICIPATION_PROB", 0.5))
 AGGREGATION_TIMEOUT = float(os.environ.get("FL_AGG_TIMEOUT", 45.0))
+ROUND_DEADLINE = float(os.environ.get("FL_ROUND_DEADLINE", 120.0))  # Max wait with zero updates
 MIN_UPDATES_TO_AGGREGATE = 2
+STATIC_NUM_CLIENTS = int(os.environ.get("FL_NUM_CLIENTS", 0)) or None
 
 # Track active clients dynamically
 connected_clients = set()
-first_submission_time = {}
+round_announced_time = {}   # {round_id: time} set at selection; used for ROUND_DEADLINE
+first_submission_time = {}  # {round_id: time} set on first update received; used for AGGREGATION_TIMEOUT
 selected_clients_by_round = {}
 submitted_clients_by_round = {}
 aggregation_in_progress = False  # Prevent double aggregation
@@ -52,7 +76,9 @@ last_p_adjust_round = -1
 
 
 def get_num_clients():
-    """Get number of connected clients dynamically"""
+    """Get number of connected clients. Uses FL_NUM_CLIENTS env var if set (stable), else dynamic."""
+    if STATIC_NUM_CLIENTS is not None:
+        return STATIC_NUM_CLIENTS
     return len(connected_clients) if len(connected_clients) > 0 else MIN_UPDATES_TO_AGGREGATE
 
 
@@ -90,7 +116,7 @@ def select_participants_for_round(round_idx: int):
     
     sampled = set(random.sample(list(connected_clients), k))
     selected_clients_by_round[round_idx] = sampled
-    first_submission_time.setdefault(round_idx, time.time())
+    round_announced_time.setdefault(round_idx, time.time())
     
     # Initialize round participation tracking
     round_participation[round_idx] = {
@@ -105,6 +131,14 @@ def select_participants_for_round(round_idx: int):
         add_to_client_history(client_id, "selected", {"round": round_idx})
     
     print(f"[SERVER] Selected {len(sampled)} participants for round {round_idx}: {sorted(list(sampled))}")
+
+    # Notify clients via Service Bus (if enabled)
+    if sb_manager:
+        try:
+            sb_manager.publish_round_control(round_idx, sorted(list(sampled)))
+        except Exception as e:
+            print(f"[SB] Failed to publish round-control: {e}")
+
     return sampled
 
 
@@ -151,10 +185,8 @@ def perform_aggregation(round_num, trigger="normal"):
             round_participation[round_num]["submitted"] = list(submitted_set)
         
         # Cleanup
-        if finished_round in submitted_clients_by_round:
-            del submitted_clients_by_round[finished_round]
-        if finished_round in first_submission_time:
-            del first_submission_time[finished_round]
+        for d in (submitted_clients_by_round, first_submission_time, round_announced_time):
+            d.pop(finished_round, None)
 
         try:
             adjust_participation()
@@ -178,9 +210,26 @@ def perform_aggregation(round_num, trigger="normal"):
         })
 
         print(f"[SERVER] ✅ Round {finished_round} complete. Acc: {accuracy:.2%}, Loss: {loss:.4f}")
-        
+
+        # Publish via Service Bus (if enabled)
+        if sb_manager:
+            try:
+                sb_manager.publish_global_model(
+                    agg.current_round, agg.global_model.state_dict()
+                )
+                sb_manager.publish_dashboard_event({
+                    "type": "round_complete",
+                    "round": finished_round,
+                    "accuracy": accuracy,
+                    "loss": loss,
+                    "num_updates": agg.last_num_updates,
+                    "timestamp": datetime.now().isoformat(),
+                })
+            except Exception as e:
+                print(f"[SB] Failed to publish post-aggregation events: {e}")
+
         return True
-        
+
     finally:
         aggregation_in_progress = False
 
@@ -271,6 +320,7 @@ def submit_update(upd: UpdateRequest):
 
     submitted_set.add(upd.client_id)
     submitted_clients_by_round[current_round] = submitted_set
+    first_submission_time.setdefault(current_round, time.time())
 
     # Update status and history
     clients_status[upd.client_id] = {
@@ -285,7 +335,10 @@ def submit_update(upd: UpdateRequest):
         "data_size": upd.data_size
     })
 
-    updates_needed = get_updates_per_round()
+    # Use the number of clients actually selected for this round as the threshold,
+    # not the total connected count — prevents waiting for unselected clients.
+    selected_count = len(selected_clients_by_round.get(current_round, set()))
+    updates_needed = selected_count if selected_count > 0 else get_updates_per_round()
     print(f"[SERVER] ✓ Client {upd.client_id} submitted. Updates: {len(agg.updates)}/{updates_needed}")
 
     if len(agg.updates) >= updates_needed:
@@ -383,42 +436,47 @@ def _aggregation_monitor():
     while True:
         try:
             current = agg.current_round
-            start_ts = first_submission_time.get(current, None)
-            
-            if start_ts is not None and not aggregation_in_progress:
-                elapsed = time.time() - start_ts
-                if elapsed >= AGGREGATION_TIMEOUT:
-                    had_updates = len(agg.updates) > 0
-                    
-                    # Mark missing clients as timed_out
-                    selected = selected_clients_by_round.get(current, set())
-                    submitted = submitted_clients_by_round.get(current, set())
-                    missing = selected - submitted
-                    
-                    for cid in missing:
-                        clients_status[cid] = {
-                            "status": "timed_out",
-                            "timestamp": datetime.now().isoformat(),
-                            "round": current,
-                        }
-                        add_to_client_history(cid, "timed_out", {"round": current})
-                    
-                    # Update round participation
-                    if current in round_participation:
-                        round_participation[current]["timed_out"] = list(missing)
+            announced_ts = round_announced_time.get(current, None)
+            first_update_ts = first_submission_time.get(current, None)
 
-                    if had_updates:
-                        print(f"[SERVER] Timeout ({AGGREGATION_TIMEOUT}s) - aggregating {len(agg.updates)} updates")
+            if announced_ts is not None and not aggregation_in_progress:
+                now = time.time()
+
+                # Tier 1: at least one update received — wait AGGREGATION_TIMEOUT for stragglers
+                if first_update_ts is not None:
+                    elapsed_since_update = now - first_update_ts
+                    if elapsed_since_update >= AGGREGATION_TIMEOUT:
+                        selected = selected_clients_by_round.get(current, set())
+                        submitted = submitted_clients_by_round.get(current, set())
+                        missing = selected - submitted
+                        for cid in missing:
+                            clients_status[cid] = {
+                                "status": "timed_out",
+                                "timestamp": datetime.now().isoformat(),
+                                "round": current,
+                            }
+                            add_to_client_history(cid, "timed_out", {"round": current})
+                        if current in round_participation:
+                            round_participation[current]["timed_out"] = list(missing)
+                        print(f"[SERVER] Timeout ({AGGREGATION_TIMEOUT}s after first update) - aggregating {len(agg.updates)} updates")
                         perform_aggregation(current, trigger="timeout")
-                    else:
-                        print(f"[SERVER] Timeout with no updates - advancing round")
-                        agg.current_round += 1
-                        
-                        # Cleanup
-                        if current in submitted_clients_by_round:
-                            del submitted_clients_by_round[current]
-                        if current in first_submission_time:
-                            del first_submission_time[current]
+
+                # Tier 2: no updates at all — wait ROUND_DEADLINE then abandon the round
+                elif now - announced_ts >= ROUND_DEADLINE:
+                    print(f"[SERVER] Round deadline ({ROUND_DEADLINE}s) with no updates - advancing round")
+                    new_round = current + 1
+                    agg.current_round = new_round
+
+                    # Cleanup old round state
+                    for d in (submitted_clients_by_round, first_submission_time, round_announced_time):
+                        d.pop(current, None)
+
+                    # Publish current model to SB so clients can start the new round
+                    if sb_manager:
+                        try:
+                            sb_manager.publish_global_model(new_round, agg.global_model.state_dict())
+                        except Exception as e:
+                            print(f"[SB] Failed to publish model after round advance: {e}")
 
             time.sleep(1.0)
         except Exception as e:
@@ -428,6 +486,85 @@ def _aggregation_monitor():
 
 monitor_thread = threading.Thread(target=_aggregation_monitor, daemon=True)
 monitor_thread.start()
+
+
+# ============ SERVICE BUS RECEIVER THREAD ============
+
+def _sb_update_receiver():
+    """Background thread: receive client updates from the Service Bus queue.
+
+    Mirrors the logic in the /submit_update endpoint but reads from the
+    'client-updates' queue instead of HTTP POST. Uses the claim-check
+    pattern to retrieve full weight tensors from Blob Storage.
+    """
+    if not sb_manager:
+        return
+
+    def handle_update(client_id, round_id, weights, data_size):
+        current_round = agg.current_round
+
+        # Round validation (same as HTTP endpoint)
+        if round_id != current_round:
+            print(f"[SB] Stale update from client {client_id} "
+                  f"(client_round={round_id}, server_round={current_round}) - rejecting")
+            return
+
+        # Duplicate check
+        submitted_set = submitted_clients_by_round.get(current_round, set())
+        if client_id in submitted_set:
+            print(f"[SB] Duplicate submission from client {client_id} - rejecting")
+            return
+
+        connected_clients.add(client_id)
+
+        # Weights arrive as {str: Tensor} from blob deserialization;
+        # convert to JSON-compatible lists so the aggregator handles them
+        # the same way as HTTP submissions.
+        weights_as_lists = {k: v.cpu().tolist() for k, v in weights.items()}
+
+        try:
+            agg.receive_update(weights_as_lists, data_size)
+        except Exception as e:
+            print(f"[SB] Failed to process update from {client_id}: {e}")
+            return
+
+        submitted_set.add(client_id)
+        submitted_clients_by_round[current_round] = submitted_set
+        first_submission_time.setdefault(current_round, time.time())
+
+        clients_status[client_id] = {
+            "status": "submitted",
+            "timestamp": datetime.now().isoformat(),
+            "data_size": data_size,
+            "round": current_round,
+        }
+        add_to_client_history(client_id, "submitted", {
+            "round": current_round,
+            "data_size": data_size,
+            "transport": "servicebus",
+        })
+
+        selected_count = len(selected_clients_by_round.get(current_round, set()))
+        updates_needed = selected_count if selected_count > 0 else get_updates_per_round()
+        print(f"[SB] Client {client_id} submitted. Updates: {len(agg.updates)}/{updates_needed}")
+
+        if len(agg.updates) >= updates_needed:
+            perform_aggregation(current_round, trigger="sufficient_updates_sb")
+
+    print("[SB] Starting client-updates receiver thread...")
+    sb_manager.receive_client_updates(handle_update)
+
+
+if sb_manager:
+    sb_receiver_thread = threading.Thread(target=_sb_update_receiver, daemon=True)
+    sb_receiver_thread.start()
+
+    # Publish the initial global model so clients can start round 0 without HTTP fallback
+    try:
+        sb_manager.publish_global_model(agg.current_round, agg.global_model.state_dict())
+        print(f"[SB] Published initial global model for round {agg.current_round}")
+    except Exception as e:
+        print(f"[SB] Failed to publish initial global model: {e}")
 
 
 # ============ HELPER FUNCTIONS ============
@@ -466,10 +603,13 @@ def evaluate_model():
 if __name__ == "__main__":
     import uvicorn
 
+    transport_mode = "Azure Service Bus" if sb_manager else "HTTP (REST)"
+
     print("=" * 70)
     print("🚀 FEDERATED LEARNING SERVER")
     print("=" * 70)
     print(f"📍 Server:    http://127.0.0.1:9000")
+    print(f"🔗 Transport: {transport_mode}")
     print(f"⚙️  Min Updates: {MIN_UPDATES_TO_AGGREGATE}")
     print(f"⚙️  Participation: {PARTICIPATION_PROB * 100:.0f}%")
     print(f"⚙️  Timeout: {AGGREGATION_TIMEOUT}s")
