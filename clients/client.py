@@ -80,10 +80,18 @@ def run_client_loop_sb(
     print(f"[Client {client_id}] Running in Service Bus transport mode")
 
     while True:
-        # --- Phase 1: Wait for round selection via Service Bus ---
+        # --- Phase 1: Register with server to trigger round selection ---
+        # The server only publishes round-control when it knows clients are connected.
+        # Calling /should_participate registers this client and triggers the SB publish.
+        try:
+            requests.get(f"{SERVER_URL}/should_participate", params={"client_id": client_id}, timeout=5)
+        except Exception:
+            pass  # Non-fatal: server may not be reachable, SB message may already be published
+
+        # --- Phase 1b: Wait for round selection via Service Bus ---
         print(f"[Client {client_id}] Waiting for round-control message...")
         round_id, selected = sb_manager.wait_for_round_control(
-            client_id, timeout=120.0
+            client_id, timeout=300.0
         )
 
         if round_id is None:
@@ -406,12 +414,13 @@ if __name__ == "__main__":
                 cid = int(client_id)
             except Exception:
                 cid = 0
-            # pick loader for this client id
-            train_loader = clients_loaders.get(cid, None)
+            # Map 1-indexed client IDs to 0-indexed partitions
+            partition_idx = (cid - 1) % num_clients if num_clients else cid
+            train_loader = clients_loaders.get(partition_idx, None)
             # Validate requested client id if server provided it
-            if num_clients is not None and (cid < 0 or cid >= num_clients):
+            if num_clients is not None and (cid < 1):
                 print(
-                    f"[CLIENT] ERROR: client_id={cid} out of range for num_clients={num_clients}. Falling back to full loader."
+                    f"[CLIENT] ERROR: client_id={cid} invalid. Falling back to full loader."
                 )
                 train_loader, _ = get_dataloader()
             else:
@@ -419,10 +428,10 @@ if __name__ == "__main__":
                 if train_loader is not None:
                     try:
                         print(
-                            f"[CLIENT] Loaded partition for client {cid}: {len(train_loader.dataset)} samples"
+                            f"[CLIENT] Loaded partition {partition_idx} for client {cid}: {len(train_loader.dataset)} samples"
                         )
                     except Exception:
-                        print(f"[CLIENT] Loaded partition for client {cid}")
+                        print(f"[CLIENT] Loaded partition {partition_idx} for client {cid}")
             if train_loader is None:
                 # fallback to full loader
                 print(
